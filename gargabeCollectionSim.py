@@ -34,6 +34,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.animation import PillowWriter
+from matplotlib.patches import Rectangle, Circle
+import matplotlib.lines as mlines
 
 # AgentPy for RL/simulation model
 try:
@@ -48,8 +50,8 @@ DEFAULT_CONFIG = {
     'width': 40,
     'height': 28,
     'n_trucks': 4,
-    'n_bins': 40,
-    'n_obstacles': 80,
+    'n_bins': 20,
+    'n_obstacles': 10,
     'n_depots': 3,
     'bin_capacity': 100.0,
     'bin_fill_rate': 1.0,            # per timestep
@@ -430,6 +432,11 @@ class Simulator:
             depot_points = [(0,0)]
         self.partitioner = VoronoiPartitioner(depot_points, self.world)
 
+        self.total_distance = 0
+        self.collected_count = 0
+        self.t = 0
+
+
     def step_bins(self):
         for b in self.bins:
             b.step()
@@ -440,114 +447,213 @@ class Simulator:
     def plan_with_astar(self, truck: Truck, goal: GridPos) -> Optional[List[GridPos]]:
         return astar(self.world, truck.pos, goal)
 
-    def run_episode(self, max_steps=500, render=False):
+    def run_episode(self, max_steps=2000, render=False):
         frames = []
-        stats = {'serviced':0, 'energy_penalties':0, 'collisions':0}
+        stats = {'serviced': 0, 'energy_penalties': 0, 'collisions': 0}
+
         for step in range(max_steps):
+
+            self.t = step   # Para mostrar en las estadísticas de draw_world
+
+            # ---------------------------------------------------------
+            # 1. ACTUALIZAR BINS
+            # ---------------------------------------------------------
             self.step_bins()
             need_bins = self.find_bins_needing_service()
             assigned = set()
+
+            # ---------------------------------------------------------
+            # 2. ASIGNACIÓN DE TAREAS A TRUCKS
+            # ---------------------------------------------------------
             for t in self.trucks:
+
                 if t.state == 'idle' or not t.path:
-                    bins_in_partition = [i for i in need_bins if self.partitioner.region_of(self.bins[i].pos) == self.partitioner.region_of(t.pos)]
+
+                    # filtrar bins por región Voronoi
+                    bins_in_partition = [
+                        i for i in need_bins
+                        if self.partitioner.region_of(self.bins[i].pos)
+                        == self.partitioner.region_of(t.pos)
+                    ]
+
+                    # fallback
                     if not bins_in_partition:
                         bins_in_partition = need_bins
+
                     if bins_in_partition:
-                        bid = min(bins_in_partition, key=lambda i: manhattan(t.pos, self.bins[i].pos))
+                        bid = min(
+                            bins_in_partition,
+                            key=lambda i: manhattan(t.pos, self.bins[i].pos)
+                        )
                         assigned.add(bid)
                         path = self.plan_with_astar(t, self.bins[bid].pos)
+
                         if path:
                             t.path = path
                             t.state = 'to_bin'
+
+            # ---------------------------------------------------------
+            # 3. MOVIMIENTO Y RECOLECCIÓN
+            # ---------------------------------------------------------
             occupied = defaultdict(list)
+
             for t in self.trucks:
+
                 if t.path and len(t.path) > 0:
+
                     nextpos = t.path.pop(0)
+
+                    # distancia total recorrida
+                    self.total_distance += 1
+
                     t.energy -= t.step_cost()
                     t.pos = nextpos
                     occupied[t.pos].append(t.id)
+
+                    # si llega a un bin
                     if t.state == 'to_bin' and any(b.pos == t.pos for b in self.bins):
-                        b_idx = next(i for i,b in enumerate(self.bins) if b.pos == t.pos)
+
+                        b_idx = next(i for i, b in enumerate(self.bins) if b.pos == t.pos)
+
                         amount = min(self.bins[b_idx].level, t.capacity - t.load)
                         t.load += amount
                         self.bins[b_idx].level -= amount
+
+                        # estadística
                         stats['serviced'] += 1
+                        self.collected_count += 1
+
+                        # si está lleno o con energía baja -> regresa
                         if t.is_full() or t.energy < 0.1 * self.config['truck_energy']:
                             depotpos = self.depots[t.home_depot].pos
                             path = self.plan_with_astar(t, depotpos)
                             t.path = path if path else []
                             t.state = 'to_depot'
+
                 else:
+                    # penalización por quedarse sin energía
                     if t.energy <= 0:
                         stats['energy_penalties'] += 1
                         t.energy = 0
                         t.state = 'idle'
+
+            # ---------------------------------------------------------
+            # 4. DETECTAR COLISIONES
+            # ---------------------------------------------------------
             for pos, ids in occupied.items():
                 if len(ids) > 1:
-                    stats['collisions'] += len(ids)-1
-            if render:
+                    stats['collisions'] += len(ids) - 1
+
+            # ---------------------------------------------------------
+            # 5. ALMACENAR FRAME (CADA 10 PASOS)
+            # ---------------------------------------------------------
+            if render and step % 10 == 0:
                 frames.append(self.render_frame())
+
         return stats, frames
 
-    def render_frame(self):
-        """Render a frame of the environment to an RGB numpy array."""
-        fig, ax = plt.subplots(figsize=(6, 6))
+    # ----------------------------------------------------------------
+    # Dibuja el mundo completo como un frame de la simulación
+    # ----------------------------------------------------------------
+    def draw_world(self, ax):
+        ax.clear()
 
-        # --- FIX: usar dimensiones reales ---
+        # Cuadrícula
+        ax.set_xticks(np.arange(0, self.world.width + 1, 1))
+        ax.set_yticks(np.arange(0, self.world.height + 1, 1))
+        ax.grid(True, color='gray', linewidth=0.5, alpha=0.3)
+
         ax.set_xlim(-0.5, self.world.width - 0.5)
         ax.set_ylim(-0.5, self.world.height - 0.5)
-        ax.set_xticks([])
-        ax.set_yticks([])
         ax.set_aspect('equal')
 
-        # FIX: nueva forma de obtener colormap
-        cmap = matplotlib.colormaps.get_cmap('tab10')
-
-        # --- Obstacles ---
-        # FIX: obstacles están dentro de self.world.grid (1 == obstacle)
+        # ---------------------------------------------------------
+        # DIBUJO DE OBSTÁCULOS
+        # ---------------------------------------------------------
         for y in range(self.world.height):
             for x in range(self.world.width):
                 if self.world.grid[y, x] == 1:
-                    ax.add_patch(
-                        plt.Rectangle((x - 0.5, y - 0.5), 1, 1, color='black')
-                    )
+                    ax.add_patch(plt.Rectangle((x - 0.5, y - 0.5), 1, 1, 
+                                              facecolor='black', edgecolor='black'))
 
-        # --- Depots ---
-        for d in self.depots:
-            x, y = d.pos
-            ax.add_patch(
-                plt.Circle((x, y), 0.4, color='gold')
-            )
+        # ---------------------------------------------------------
+        # DIBUJO DE DEPOTS
+        # ---------------------------------------------------------
+        for depot in self.depots:
+            x, y = depot.pos
+            ax.add_patch(plt.Circle((x, y), 0.3, facecolor='gold', edgecolor='black', linewidth=2))
 
-        # --- Bins ---
-        for b in self.bins:
-            x, y = b.pos
-            fill_ratio = b.level / b.capacity
-            ax.add_patch(
-                plt.Rectangle((x - 0.4, y - 0.4), 0.8, 0.8, color=(1, 0, 0, fill_ratio))
-            )
+        # ---------------------------------------------------------
+        # DIBUJO DE BINS
+        # ---------------------------------------------------------
+        for bin_obj in self.bins:
+            x, y = bin_obj.pos
+            # Color según nivel de llenado
+            fill_ratio = min(1.0, bin_obj.level / bin_obj.capacity)
+            color = (1, 0, 0, fill_ratio) if fill_ratio > 0 else 'lightgreen'
+            ax.add_patch(plt.Rectangle((x - 0.35, y - 0.35), 0.7, 0.7, 
+                                      facecolor=color, edgecolor='darkgreen', linewidth=1))
 
-        # --- Trucks ---
-        for i, t in enumerate(self.trucks):
-            x, y = t.pos
-            ax.scatter(
-                x, y,
-                s=150,
-                color=cmap(i % 10),
-                edgecolors='white',
-                linewidth=1.5,
-                zorder=5
-            )
+        # ---------------------------------------------------------
+        # DIBUJO DE TRUCKS
+        # ---------------------------------------------------------
+        cmap = matplotlib.colormaps.get_cmap('tab10')
+        for i, truck in enumerate(self.trucks):
+            x, y = truck.pos
+            color = cmap(i % 10)
+            ax.scatter(x, y, s=150, color=color, edgecolors='white', linewidth=1.5, zorder=5)
+            # Mostrar carga dentro del círculo
+            load_text = f'{int(truck.load)}'
+            ax.text(x, y, load_text, ha='center', va='center', fontsize=8, color='white', weight='bold')
 
-        # Render canvas
-        fig.canvas.draw()
+        # ---------------------------------------------------------
+        # LEYENDA
+        # ---------------------------------------------------------
+        truck_handle = mlines.Line2D([], [], color='blue', marker='o', markersize=10,
+                                    linestyle='None', label='Truck')
+        bin_handle = mlines.Line2D([], [], color='lightgreen', marker='s', markersize=10,
+                                linestyle='None', label='Bin (empty)')
+        bin_full_handle = mlines.Line2D([], [], color='red', marker='s', markersize=10,
+                                       linestyle='None', label='Bin (full)')
+        depot_handle = mlines.Line2D([], [], color='gold', marker='*', markersize=15,
+                                    linestyle='None', label='Depot')
+        obs_handle = mlines.Line2D([], [], color='black', marker='s', markersize=10,
+                                linestyle='None', label='Obstacle')
 
-        # Convertir a array
-        buf = np.asarray(fig.canvas.buffer_rgba())  # devuelve un array RGBA
-        img = buf[:, :, :3].copy()  # convertimos RGBA → RGB
+        ax.legend(handles=[truck_handle, bin_handle, bin_full_handle, depot_handle, obs_handle],
+                loc='upper right', fontsize=9)
+
+        # ---------------------------------------------------------
+        # ESTADÍSTICAS EN PANTALLA
+        # ---------------------------------------------------------
+        serviced_bins = sum(1 for b in self.bins if b.level < 1.0)
+        step = getattr(self, 't', 0)
+
+        stats = f"""
+Serviced bins: {serviced_bins}/{len(self.bins)}
+Trucks: {len(self.trucks)}
+Step: {step}
+        """
+
+        ax.text(0.02, 0.98, stats, transform=ax.transAxes,
+                verticalalignment='top', fontsize=9, 
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        return ax
+
+    # ----------------------------------------------------------------
+    # Frame de salida para GIF
+    # ----------------------------------------------------------------
+    def render_frame(self):
+        fig, ax = plt.subplots(figsize=(6, 6))
+        self.draw_world(ax)
+
+        fig.canvas.draw()  # Necesario para evitar error tostring_rgb
+        buffer = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
 
         plt.close(fig)
-        return img
+        return buffer
+
 
 # -----------------------------
 # Benchmark utilities
@@ -566,7 +672,7 @@ def run_benchmark(config: dict, repeats: int=3, out_csv: str='benchmark.csv'):
             st = time.time()
             p = sim.plan_with_astar(t, sim.bins[bid].pos)
             plan_time += time.time() - st
-        stats, frames = sim.run_episode(max_steps=200, render=False)
+        stats, frames = sim.run_episode(max_steps=2000, render=False)
         sim_time = 0.0  # included in stats timing if needed
         rows.append(['default', rep, config['n_trucks'], config['n_bins'], config['n_obstacles'], round(plan_time,4), round(sim_time,4), stats['serviced'], stats['energy_penalties'], stats['collisions']])
         print(f'bench rep {rep} plan_time {plan_time:.3f}s serviced {stats["serviced"]}')
@@ -580,16 +686,28 @@ def run_benchmark(config: dict, repeats: int=3, out_csv: str='benchmark.csv'):
 # -----------------------------
 # GIF export helper
 # -----------------------------
-def save_frames_as_gif(frames: List[np.ndarray], filename: str, interval_ms: int = 200):
+def save_frames_as_gif(frames, filename, interval_ms=200):
     if not frames:
+        print("No frames to save.")
         return
-    fig = plt.figure(figsize=(6,4)); plt.axis('off')
+    fig = plt.figure(figsize=(6, 6))
+    plt.axis('off')
     im = plt.imshow(frames[0])
+
     def update(i):
-        im.set_data(frames[i]); return [im]
-    ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=interval_ms, blit=True)
-    writer = PillowWriter(fps=1000/interval_ms)
+        im.set_data(frames[i])
+        return [im]
+
+    ani = animation.FuncAnimation(
+        fig, update,
+        frames=len(frames),
+        interval=interval_ms,
+        blit=True
+    )
+
+    writer = PillowWriter(fps=1000 / interval_ms)
     ani.save(filename, writer=writer)
+
     plt.close(fig)
 
 # -----------------------------
@@ -600,7 +718,7 @@ def demo(config=None):
     if config:
         cfg.update(config)
     sim = Simulator(cfg)
-    stats, frames = sim.run_episode(max_steps=300, render=True)
+    stats, frames = sim.run_episode(max_steps=1000, render=True)
     if frames:
         save_frames_as_gif(frames, cfg['gif_path'], interval_ms=cfg['frame_interval_ms'])
         print('Saved GIF to', cfg['gif_path'])
