@@ -47,8 +47,8 @@ except Exception as e:
 # Configuration and utilities
 # -----------------------------
 DEFAULT_CONFIG = {
-    'width': 40,
-    'height': 28,
+    'width': 100,
+    'height': 100,
     'n_trucks': 4,
     'n_bins': 20,
     'n_obstacles': 10,
@@ -62,7 +62,7 @@ DEFAULT_CONFIG = {
     'truck_speed': 1,                # grid cells per step (not used for fractional moves)
     'seed': 0,
     'gif_path': 'garbage_sim.gif',
-    'frame_interval_ms': 200,
+    'frame_interval_ms': 500,
     'benchmark_repeats': 3,
 }
 
@@ -555,104 +555,108 @@ class Simulator:
     # ----------------------------------------------------------------
     # Dibuja el mundo completo como un frame de la simulación
     # ----------------------------------------------------------------
-    def draw_world(self, ax):
-        ax.clear()
+    def draw_clean_world(self, ax):
 
-        # Cuadrícula
-        ax.set_xticks(np.arange(0, self.world.width + 1, 1))
-        ax.set_yticks(np.arange(0, self.world.height + 1, 1))
-        ax.grid(True, color='gray', linewidth=0.5, alpha=0.3)
-
-        ax.set_xlim(-0.5, self.world.width - 0.5)
-        ax.set_ylim(-0.5, self.world.height - 0.5)
-        ax.set_aspect('equal')
-
-        # ---------------------------------------------------------
-        # DIBUJO DE OBSTÁCULOS
-        # ---------------------------------------------------------
+        # ===============================
+        # OBSTÁCULOS
+        # ===============================
         for y in range(self.world.height):
             for x in range(self.world.width):
                 if self.world.grid[y, x] == 1:
-                    ax.add_patch(plt.Rectangle((x - 0.5, y - 0.5), 1, 1, 
-                                              facecolor='black', edgecolor='black'))
+                    ax.scatter(x, y, c='black', s=40, marker='x', alpha=0.8)
 
-        # ---------------------------------------------------------
-        # DIBUJO DE DEPOTS
-        # ---------------------------------------------------------
+        # ===============================
+        # DEPOTS
+        # ===============================
         for depot in self.depots:
             x, y = depot.pos
-            ax.add_patch(plt.Circle((x, y), 0.3, facecolor='gold', edgecolor='black', linewidth=2))
+            ax.scatter(x, y, c='purple', s=140, marker='D')
 
-        # ---------------------------------------------------------
-        # DIBUJO DE BINS
-        # ---------------------------------------------------------
-        for bin_obj in self.bins:
-            x, y = bin_obj.pos
-            # Color según nivel de llenado
-            fill_ratio = min(1.0, bin_obj.level / bin_obj.capacity)
-            color = (1, 0, 0, fill_ratio) if fill_ratio > 0 else 'lightgreen'
-            ax.add_patch(plt.Rectangle((x - 0.35, y - 0.35), 0.7, 0.7, 
-                                      facecolor=color, edgecolor='darkgreen', linewidth=1))
+        # ===============================
+        # BINS
+        # ===============================
+        for i, b in enumerate(self.bins):
+            fill_level = b.level / b.capacity
+            ready = fill_level >= self.config.get("pickup_threshold", 0.7)
 
-        # ---------------------------------------------------------
-        # DIBUJO DE TRUCKS
-        # ---------------------------------------------------------
-        cmap = matplotlib.colormaps.get_cmap('tab10')
-        for i, truck in enumerate(self.trucks):
-            x, y = truck.pos
-            color = cmap(i % 10)
-            ax.scatter(x, y, s=150, color=color, edgecolors='white', linewidth=1.5, zorder=5)
-            # Mostrar carga dentro del círculo
-            load_text = f'{int(truck.load)}'
-            ax.text(x, y, load_text, ha='center', va='center', fontsize=8, color='white', weight='bold')
+            color = 'red' if ready else 'green'
+            alpha = 0.3 + 0.7 * fill_level
 
-        # ---------------------------------------------------------
-        # LEYENDA
-        # ---------------------------------------------------------
-        truck_handle = mlines.Line2D([], [], color='blue', marker='o', markersize=10,
-                                    linestyle='None', label='Truck')
-        bin_handle = mlines.Line2D([], [], color='lightgreen', marker='s', markersize=10,
-                                linestyle='None', label='Bin (empty)')
-        bin_full_handle = mlines.Line2D([], [], color='red', marker='s', markersize=10,
-                                       linestyle='None', label='Bin (full)')
-        depot_handle = mlines.Line2D([], [], color='gold', marker='*', markersize=15,
-                                    linestyle='None', label='Depot')
-        obs_handle = mlines.Line2D([], [], color='black', marker='s', markersize=10,
-                                linestyle='None', label='Obstacle')
+            ax.scatter(b.pos[0], b.pos[1], c=color, s=80, marker='o', alpha=alpha)
 
-        ax.legend(handles=[truck_handle, bin_handle, bin_full_handle, depot_handle, obs_handle],
-                loc='upper right', fontsize=9)
+        # ===============================
+        # TRUCKS
+        # ===============================
+        for t in self.trucks:
+            x, y = t.pos
+            assigned = (t.state == 'to_bin')
 
-        # ---------------------------------------------------------
-        # ESTADÍSTICAS EN PANTALLA
-        # ---------------------------------------------------------
-        serviced_bins = sum(1 for b in self.bins if b.level < 1.0)
-        step = getattr(self, 't', 0)
+            color = 'darkblue' if assigned else 'blue'
 
-        stats = f"""
-Serviced bins: {serviced_bins}/{len(self.bins)}
-Trucks: {len(self.trucks)}
-Step: {step}
-        """
+            ax.scatter(x, y, c=color, s=40, marker='s', alpha=0.9)
 
-        ax.text(0.02, 0.98, stats, transform=ax.transAxes,
-                verticalalignment='top', fontsize=9, 
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        # ===============================
+        # PATHS (opcional)
+        # ===============================
+        for t in self.trucks:
+            if t.path and len(t.path) > 0:
+                xs = [p[0] for p in t.path]
+                ys = [p[1] for p in t.path]
+                ax.plot(xs, ys, 'b--', alpha=0.3, linewidth=1)
 
-        return ax
+        # ===============================
+        # STATUS TEXT
+        # ===============================
+        serviced_bins = sum(1 for b in self.bins if b.level < b.capacity)
+        total_load = sum(t.load for t in self.trucks)
+
+        ax.text(
+            0.02, 0.98,
+            f"Serviced: {serviced_bins}/{len(self.bins)}\n"
+            f"Total Load: {total_load:.1f}\n"
+            f"Total Distance: {self.total_distance}\n",
+            transform=ax.transAxes,
+            verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+            fontsize=10
+        )
+
 
     # ----------------------------------------------------------------
     # Frame de salida para GIF
     # ----------------------------------------------------------------
     def render_frame(self):
-        fig, ax = plt.subplots(figsize=(6, 6))
-        self.draw_world(ax)
+        fig, ax = plt.subplots(figsize=(10, 7), dpi=300)
 
-        fig.canvas.draw()  # Necesario para evitar error tostring_rgb
-        buffer = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+        ax.set_xlim(-1, self.world.width + 1)
+        ax.set_ylim(-1, self.world.height + 1)
+        ax.set_aspect('equal')
+
+        # cuadrícula ligera
+        ax.grid(True, alpha=0.25)
+
+        ax.set_title(f"Garbage Collection Simulation — Step {self.t}")
+
+        # Dibujar entidades
+        self.draw_clean_world(ax)
+
+        # Renderizamos
+        fig.canvas.draw()
+
+        # Tomamos ARGB (que siempre existe)
+        argb = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+
+        w, h = fig.canvas.get_width_height()
+
+        # Convertir ARGB → RGB
+        argb = argb.reshape((h, w, 4))
+        rgb = argb[:, :, 1:]   # ignorar canal alfa
+
+        img = rgb.copy()
 
         plt.close(fig)
-        return buffer
+
+        return img
 
 
 # -----------------------------
