@@ -65,6 +65,11 @@ DEFAULT_CONFIG = {
     'gif_path': 'garbage_sim.gif',
     'frame_interval_ms': 500,
     'benchmark_repeats': 3,
+    'frame_skip': 1,
+    'initial_bin_fill': 1.0,       # fraction of capacity to initialize bins with (1.0 = full)
+    'initial_bin_fill_random': False,
+    'initial_bin_fill_min': 0.5,
+    'verbose': False,
     'bin_refill_cooldown': 50,         # pasos que tarda un bin en volver a llenarse
     'collision_energy_penalty': 5.0
 }
@@ -456,7 +461,15 @@ class Simulator:
         self.bins: List[Bin] = []
         for _ in range(self.config['n_bins']):
             pos = self.world.random_free_cell()
-            self.bins.append(Bin(pos, self.config['bin_capacity'], fill_rate=self.config['bin_fill_rate'], refill_cooldown=self.config.get('bin_refill_cooldown',50)))
+            b = Bin(pos, self.config['bin_capacity'], fill_rate=self.config['bin_fill_rate'], refill_cooldown=self.config.get('bin_refill_cooldown',50))
+            # inicializar nivel: por defecto lleno, opcionalmente aleatorio entre min y 1.0
+            if self.config.get('initial_bin_fill_random', False):
+                minf = float(self.config.get('initial_bin_fill_min', 0.5))
+                frac = _rng.uniform(minf, 1.0)
+            else:
+                frac = float(self.config.get('initial_bin_fill', 1.0))
+            b.level = max(0.0, min(b.capacity, frac * b.capacity))
+            self.bins.append(b)
         self.depots: List[Depot] = []
         for _ in range(self.config['n_depots']):
             pos = self.world.random_free_cell()
@@ -577,6 +590,8 @@ class Simulator:
                                         if amount > 0:
                                             t.load += amount
                                             b_obj.level -= amount
+                                            if self.config.get('verbose', False):
+                                                print(f"[STEP {self.t}] Truck {t.id} collected {amount} from bin {b_idx} at {b_obj.pos}. New level={b_obj.level}")
                                             stats['serviced'] += 1
                                             self.collected_count += 1
                                             if hasattr(t, 'collected_bins'):
@@ -591,7 +606,11 @@ class Simulator:
                                             if t.is_full() or t.energy < 0.1 * self.config['truck_energy']:
                                                 depotpos = self.depots[t.home_depot].pos
                                                 pathd = self.plan_with_astar(t, depotpos)
-                                                t.path = pathd if pathd else []
+                                                if pathd:
+                                                    t.path = pathd[1:] if len(pathd) > 1 else []
+                                                else:
+                                                    t.path = []
+                                                t.state = 'to_depot'
                                                 t.state = 'to_depot'
                                             else:
                                                 t.state = 'idle'
@@ -655,6 +674,8 @@ class Simulator:
                                 if amount > 0:
                                     t.load += amount
                                     b_obj.level -= amount
+                                    if self.config.get('verbose', False):
+                                        print(f"[STEP {self.t}] Truck {t.id} collected {amount} from bin {b_idx} at {b_obj.pos}. New level={b_obj.level}")
 
                                     # contabilizar una recolección válida
                                     stats['serviced'] += 1
@@ -673,12 +694,22 @@ class Simulator:
                                     if t.is_full() or t.energy < 0.1 * self.config['truck_energy']:
                                         depotpos = self.depots[t.home_depot].pos
                                         path = self.plan_with_astar(t, depotpos)
-                                        t.path = path if path else []
+                                        if path:
+                                            t.path = path[1:] if len(path) > 1 else []
+                                        else:
+                                            t.path = []
                                         t.state = 'to_depot'
                                     else:
                                         # si aún puede seguir, liberar estado para reasignación
                                         t.state = 'idle'
                                         t.path = []
+                                # si está en ruta a depot y llegó, descargar
+                                if t.state == 'to_depot' and any(d.pos == t.pos for d in self.depots):
+                                    # unload
+                                    t.load = 0.0
+                                    t.energy = self.config.get('truck_energy', t.energy)
+                                    t.state = 'idle'
+                                    t.path = []
                             else:
                                 # si bin vacío, liberamos su reserva para que no bloquee
                                 b_obj.reserved_by = None
@@ -690,6 +721,13 @@ class Simulator:
                         stats['energy_penalties'] += 1
                         t.energy = 0
                         t.state = 'idle'
+
+                # --- Si está en ruta a depot y llegó, descargar (también cubre casos fuera de la recolección)
+                if t.state == 'to_depot' and any(d.pos == t.pos for d in self.depots):
+                    t.load = 0.0
+                    t.energy = self.config.get('truck_energy', t.energy)
+                    t.state = 'idle'
+                    t.path = []
 
             # ---------------------------------------------------------
             # 🔵 REGISTRO PARA GRAFICAS DE PERFORMANCE
@@ -708,7 +746,8 @@ class Simulator:
             # ---------------------------------------------------------
             # 5. ALMACENAR FRAME (CADA 10 PASOS)
             # ---------------------------------------------------------
-            if render and step % 10 == 0:
+            frame_skip = int(self.config.get('frame_skip', 1))
+            if render and step % max(1, frame_skip) == 0:
                 frames.append(self.render_frame())
 
         # -------------------------
@@ -775,7 +814,12 @@ class Simulator:
             if t.path and len(t.path) > 0:
                 xs = [p[0] for p in t.path]
                 ys = [p[1] for p in t.path]
-                ax.plot(xs, ys, 'b--', alpha=0.3, linewidth=1)
+                cmap = matplotlib.colormaps.get_cmap('tab10')
+                color = cmap(t.id % 10)
+                # línea más visible para la ruta planificada
+                ax.plot(xs, ys, linestyle='--', color=color, alpha=0.9, linewidth=2, zorder=3)
+                # marcar destino con un triángulo
+                ax.scatter(xs[-1], ys[-1], marker='v', color=color, s=60, zorder=4)
 
         # ===============================
         # STATUS TEXT
@@ -914,11 +958,10 @@ class Simulator:
             avg_eff = (sum(self.learning_progress)/len(self.learning_progress)) if getattr(self, 'learning_progress', None) else 0
             txt = (
                 f"Total episodes recorded: {len(self.episode_bins)}\n"
-                f"Total bins collected (sum episodes): {total_served}\n"
                 f"Average efficiency (bins/distance): {avg_eff:.3f}\n"
                 f"Total distance: {getattr(self, 'total_distance', 0)}"
             )
-            ax_list[5].text(0.1, 0.5, txt, fontsize=12, va='center')
+            ax_list[5].text(0.1, 0.5, txt, fontsize=20, va='center')
 
             fig_comb.tight_layout()
             save_figure(fig_comb, f"{folder}/combined_performance.png")
@@ -957,12 +1000,11 @@ class Simulator:
     def _plot_global_performance(self, ax):
         total_collected = sum(getattr(t, 'collected_bins', 0) for t in self.trucks)
         total_distance  = sum(getattr(t, 'total_distance', 0)  for t in self.trucks)
-        total_capacity  = sum(t.capacity for t in self.trucks)
 
-        metrics = ["Collected", "Distance", "Total Capacity"]
-        values  = [total_collected, total_distance, total_capacity]
+        metrics = ["Total Collected", "Total Distance"]
+        values = [total_collected, total_distance]
 
-        bars = ax.bar(metrics, values, color=['blue', 'orange', 'purple'], alpha=0.7)
+        bars = ax.bar(metrics, values, color=['blue', 'orange'], alpha=0.7)
         ax.set_title("Overall Performance")
         ax.set_ylabel("Value")
 
