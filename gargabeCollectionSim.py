@@ -65,6 +65,8 @@ DEFAULT_CONFIG = {
     'gif_path': 'garbage_sim.gif',
     'frame_interval_ms': 500,
     'benchmark_repeats': 3,
+    'bin_refill_cooldown': 50,         # pasos que tarda un bin en volver a llenarse
+    'collision_energy_penalty': 5.0
 }
 
 _rng = random.Random()
@@ -108,17 +110,35 @@ class GridWorld:
                 return (x, y)
 
 class Bin:
-    def __init__(self, pos: GridPos, capacity: float, fill_rate: float = 1.0):
+    def __init__(self, pos: GridPos, capacity: float, fill_rate: float = 1.0, refill_cooldown: int = 50):
         self.pos = pos
         self.capacity = capacity
         self.fill_rate = fill_rate
         self.level = 0.0
 
-    def step(self):
-        self.level = min(self.capacity, self.level + self.fill_rate)
+        # cooldown: el tiempo (step) mínimo antes de que vuelva a llenarse tras ser vaciado
+        self.refill_cooldown = refill_cooldown
+        self.next_fill_time = 0    # paso a partir del cual empezará a llenarse de nuevo
+
+        # reserva temporal cuando un camión lo ha seleccionado (evita reasignaciones rápidas)
+        self.reserved_by = None
+        self.reserved_until = 0
+
+    def step(self, current_step: int):
+        """Incrementa nivel solo si pasó el cooldown."""
+        if current_step >= self.next_fill_time:
+            self.level = min(self.capacity, self.level + self.fill_rate)
 
     def needs_service(self, threshold: float) -> bool:
         return self.level >= threshold * self.capacity
+    
+    def mark_collected(self, current_step: int):
+        """Llamar cuando un camión vacía/recoge del contenedor."""
+        # bloquear refill por el cooldown completo
+        self.next_fill_time = current_step + self.refill_cooldown
+        # liberar la reserva por si existe
+        self.reserved_by = None
+        self.reserved_until = 0
 
     def empty(self):
         self.level = 0.0
@@ -343,6 +363,26 @@ if ap is not None:
                     t.state = 'idle'
                     continue
 
+                # ---------------------------------------------------------
+                # 🔵 REGISTRO DE PERFORMANCE
+                # ---------------------------------------------------------
+
+                if not hasattr(self, 'episode_bins'):
+                    self.episode_bins = []
+                if not hasattr(self, 'episode_distance'):
+                    self.episode_distance = []
+                if not hasattr(self, 'learning_progress'):
+                    self.learning_progress = []
+
+                # cuántos bins han sido recolectados
+                collected = sum(b.capacity - b.fill for b in self.bins if b.fill < b.capacity)
+
+                # distancia aproximada recorrida (AgentPy NO tiene path logs, así que sumamos movimientos)
+                distance = sum(1 for t in self.trucks if len(t.history('positions')) > 1)
+
+                self.episode_bins.append(collected)
+                self.episode_distance.append(distance)
+
                 # find bins in truck's partition needing service
                 pos = self.grid.positions[t]
                 my_region = self.partitioner.region_of(pos)
@@ -416,7 +456,7 @@ class Simulator:
         self.bins: List[Bin] = []
         for _ in range(self.config['n_bins']):
             pos = self.world.random_free_cell()
-            self.bins.append(Bin(pos, self.config['bin_capacity'], fill_rate=self.config['bin_fill_rate']))
+            self.bins.append(Bin(pos, self.config['bin_capacity'], fill_rate=self.config['bin_fill_rate'], refill_cooldown=self.config.get('bin_refill_cooldown',50)))
         self.depots: List[Depot] = []
         for _ in range(self.config['n_depots']):
             pos = self.world.random_free_cell()
@@ -428,6 +468,10 @@ class Simulator:
             dists = [manhattan(pos, d.pos) for d in self.depots]
             t.home_depot = int(np.argmin(dists)) if dists else 0
             self.trucks.append(t)
+            # initialize per-truck stats for plotting/analysis
+            t.collected_bins = 0
+            t.total_distance = 0
+            t.action_log = [t.pos]
         depot_points = [d.pos for d in self.depots]
         if not depot_points:
             depot_points = [(0,0)]
@@ -437,10 +481,19 @@ class Simulator:
         self.collected_count = 0
         self.t = 0
 
+        # verificar cobertura de bins
+        assign_map = self.partitioner.assignment_map()
+        h,w = assign_map.shape
+        for b in self.bins:
+            x,y = b.pos
+            # assignment_map usa (h,w) indexado por [y,x] si se creó así
+            assigned_region = assign_map[y, x]
+            # puedes guardar b.region = assigned_region
+            b.region = int(assigned_region)
 
     def step_bins(self):
         for b in self.bins:
-            b.step()
+            b.step(self.t)
 
     def find_bins_needing_service(self) -> List[int]:
         return [i for i,b in enumerate(self.bins) if b.needs_service(self.config['bin_fill_threshold'])]
@@ -451,6 +504,10 @@ class Simulator:
     def run_episode(self, max_steps=2000, render=False):
         frames = []
         stats = {'serviced': 0, 'energy_penalties': 0, 'collisions': 0}
+
+        # snapshot at start of episode to compute per-episode deltas
+        start_total_distance = getattr(self, 'total_distance', 0)
+        start_collected = getattr(self, 'collected_count', 0)
 
         for step in range(max_steps):
 
@@ -482,16 +539,30 @@ class Simulator:
                         bins_in_partition = need_bins
 
                     if bins_in_partition:
-                        bid = min(
-                            bins_in_partition,
-                            key=lambda i: manhattan(t.pos, self.bins[i].pos)
-                        )
-                        assigned.add(bid)
-                        path = self.plan_with_astar(t, self.bins[bid].pos)
+                        # preferir bins no reservados o reservados por este mismo truck
+                        bins_filtered = []
+                        for i in bins_in_partition:
+                            b = self.bins[i]
+                            if b.reserved_by is None or b.reserved_by == t.id or b.reserved_until <= self.t:
+                                bins_filtered.append(i)
+                        if not bins_filtered:
+                            bins_filtered = bins_in_partition
 
+                        bid = min(bins_filtered, key=lambda i: manhattan(t.pos, self.bins[i].pos))
+                        assigned.add(bid)
+
+                        # reservar el bin para este truck durante un plazo prudente (ej. distancia estimada)
+                        bsel = self.bins[bid]
+                        est_dist = manhattan(t.pos, bsel.pos)
+                        reserve_steps = max(5, est_dist + 3)  # reserva hasta que llegue (con un extra)
+                        bsel.reserved_by = t.id
+                        bsel.reserved_until = self.t + reserve_steps
+
+                        path = self.plan_with_astar(t, bsel.pos)
                         if path:
                             t.path = path
                             t.state = 'to_bin'
+
 
             # ---------------------------------------------------------
             # 3. MOVIMIENTO Y RECOLECCIÓN
@@ -501,35 +572,71 @@ class Simulator:
             for t in self.trucks:
 
                 if t.path and len(t.path) > 0:
+                    nextpos = t.path[0]  # no pop aún
 
+                    # comprobar obstáculo en mapa
+                    if not self.world.is_free(nextpos):
+                        # choque con obstáculo
+                        stats['collisions'] += 1
+                        t.energy -= self.config.get('collision_energy_penalty', 5.0)
+                        # opcional: cancelar ruta
+                        t.path = []
+                        t.state = 'idle'
+                        continue
+
+                    # comprobar si otra camion ya está en nextpos (colisión camión-camión)
+                    occupied_by_truck = any(other.pos == nextpos and other.id != t.id for other in self.trucks)
+                    if occupied_by_truck:
+                        stats['collisions'] += 1
+                        t.energy -= self.config.get('collision_energy_penalty', 2.0)
+                        # esperar (no avanzar esta iteración)
+                        continue
+
+                    # ahora sí avanzar: pop y mover
                     nextpos = t.path.pop(0)
-
-                    # distancia total recorrida
-                    self.total_distance += 1
-
                     t.energy -= t.step_cost()
+                    # distancia
+                    self.total_distance += 1
+                    t.total_distance += 1
                     t.pos = nextpos
+                    if hasattr(t, 'action_log'):
+                        t.action_log.append(t.pos)
                     occupied[t.pos].append(t.id)
 
-                    # si llega a un bin
-                    if t.state == 'to_bin' and any(b.pos == t.pos for b in self.bins):
+                    # si llegó a un bin
+                    if t.state == 'to_bin':
+                        # buscar bin en la misma celda
+                        bins_here = [i for i,b in enumerate(self.bins) if b.pos == t.pos]
+                        if bins_here:
+                            b_idx = bins_here[0]
+                            b_obj = self.bins[b_idx]
 
-                        b_idx = next(i for i, b in enumerate(self.bins) if b.pos == t.pos)
+                            # solo recoger si tiene nivel positivo
+                            if b_obj.level > 0:
+                                amount = min(b_obj.level, t.capacity - t.load)
+                                if amount > 0:
+                                    t.load += amount
+                                    b_obj.level -= amount
 
-                        amount = min(self.bins[b_idx].level, t.capacity - t.load)
-                        t.load += amount
-                        self.bins[b_idx].level -= amount
+                                    # contabilizar una recolección válida
+                                    stats['serviced'] += 1
+                                    self.collected_count += 1
+                                    if hasattr(t, 'collected_bins'):
+                                        t.collected_bins += 1
 
-                        # estadística
-                        stats['serviced'] += 1
-                        self.collected_count += 1
+                                    # marcar que bin empieza cooldown
+                                    b_obj.mark_collected(self.t)
 
-                        # si está lleno o con energía baja -> regresa
-                        if t.is_full() or t.energy < 0.1 * self.config['truck_energy']:
-                            depotpos = self.depots[t.home_depot].pos
-                            path = self.plan_with_astar(t, depotpos)
-                            t.path = path if path else []
-                            t.state = 'to_depot'
+                                    # si está lleno o poca energía -> ir a depot
+                                    if t.is_full() or t.energy < 0.1 * self.config['truck_energy']:
+                                        depotpos = self.depots[t.home_depot].pos
+                                        path = self.plan_with_astar(t, depotpos)
+                                        t.path = path if path else []
+                                        t.state = 'to_depot'
+                            else:
+                                # si bin vacío, liberamos su reserva para que no bloquee
+                                b_obj.reserved_by = None
+                                b_obj.reserved_until = 0
 
                 else:
                     # penalización por quedarse sin energía
@@ -537,6 +644,13 @@ class Simulator:
                         stats['energy_penalties'] += 1
                         t.energy = 0
                         t.state = 'idle'
+
+            # ---------------------------------------------------------
+            # 🔵 REGISTRO PARA GRAFICAS DE PERFORMANCE
+            # ---------------------------------------------------------
+            self._ensure_learning_log()
+            self.episode_bins.append(sum(t.collected_bins for t in self.trucks))
+            self.episode_distance.append(sum(t.total_distance for t in self.trucks))
 
             # ---------------------------------------------------------
             # 4. DETECTAR COLISIONES
@@ -551,13 +665,25 @@ class Simulator:
             if render and step % 10 == 0:
                 frames.append(self.render_frame())
 
+        # -------------------------
+        # Al terminar el episodio, registrar métricas de aprendizaje (por episodio)
+        # -------------------------
+        self._ensure_learning_log()
+        # per-episode deltas
+        delta_collected = self.collected_count - start_collected
+        delta_distance = self.total_distance - start_total_distance
+        self.episode_bins.append(delta_collected)
+        self.episode_distance.append(delta_distance)
+        # eficiencia: bins recolectados por unidad de distancia (fallback si distancia 0)
+        efficiency = delta_collected / max(1, delta_distance)
+        self.learning_progress.append(efficiency)
+
         return stats, frames
 
     # ----------------------------------------------------------------
     # Dibuja el mundo completo como un frame de la simulación
     # ----------------------------------------------------------------
     def draw_clean_world(self, ax):
-
         # ===============================
         # OBSTÁCULOS
         # ===============================
@@ -622,7 +748,6 @@ class Simulator:
             fontsize=10
         )
 
-
     # ----------------------------------------------------------------
     # Frame de salida para GIF
     # ----------------------------------------------------------------
@@ -664,6 +789,216 @@ class Simulator:
 
         plt.close(fig)
         return img
+    
+    # ================================================================
+    #   PERFORMANCE PLOTS — listo para integrar
+    # ================================================================
+    # -------------------------------------------------------------------
+    # REGISTRO DE APRENDIZAJE (se crea si no existe)
+    # -------------------------------------------------------------------
+    def _ensure_learning_log(self):
+        if not hasattr(self, "learning_progress"):
+            self.learning_progress = []
+        if not hasattr(self, "episode_bins"):
+            self.episode_bins = []
+        if not hasattr(self, "episode_distance"):
+            self.episode_distance = []
+    
+    # -------------------------------------------------------------------
+    # GUARDAR TODAS LAS GRÁFICAS
+    # -------------------------------------------------------------------
+    def save_performance_plots(self, folder="plots"):
+        os.makedirs(folder, exist_ok=True)
+        self._ensure_learning_log()
+
+        # -------------------------
+        # TRUCK EFFICIENCY
+        # -------------------------
+        fig, ax = plt.subplots(figsize=(7, 5))
+        self._plot_truck_efficiency(ax)
+        save_figure(fig, f"{folder}/truck_efficiency.png")
+
+        # -------------------------
+        # PERFORMANCE GLOBAL
+        # -------------------------
+        fig, ax = plt.subplots(figsize=(7, 5))
+        self._plot_global_performance(ax)
+        save_figure(fig, f"{folder}/global_performance.png")
+
+        # -------------------------
+        # SPATIAL HEATMAP
+        # -------------------------
+        fig, ax = plt.subplots(figsize=(7, 5))
+        self._plot_spatial_movement(ax)
+        save_figure(fig, f"{folder}/movement_heatmap.png")
+
+        # -------------------------
+        # BINS OVER TIME
+        # -------------------------
+        fig, ax = plt.subplots(figsize=(7, 5))
+        self._plot_bins_progress(ax)
+        save_figure(fig, f"{folder}/bins_progress.png")
+
+        # -------------------------
+        # TRUCK INDIVIDUAL PERFORMANCE
+        # -------------------------
+        fig, ax = plt.subplots(figsize=(7, 5))
+        self._plot_truck_individual_performance(ax)
+        save_figure(fig, f"{folder}/truck_individual_performance.png")
+
+        print(f"[OK] Performance plots saved to '{folder}'")
+
+        # -------------------------
+        # Combined figure: todos los subplots en una sola imagen (2x3)
+        # -------------------------
+        fig_comb, axes = plt.subplots(2, 3, figsize=(15, 10))
+        ax_list = axes.flatten()
+
+        # colocar cada plot en un subplot
+        try:
+            self._plot_truck_efficiency(ax_list[0])
+            self._plot_global_performance(ax_list[1])
+            self._plot_spatial_movement(ax_list[2])
+            self._plot_bins_progress(ax_list[3])
+            self._plot_truck_individual_performance(ax_list[4])
+
+            # último panel: resumen de métricas
+            ax_list[5].axis('off')
+            total_served = sum(self.episode_bins) if hasattr(self, 'episode_bins') else 0
+            avg_eff = (sum(self.learning_progress)/len(self.learning_progress)) if getattr(self, 'learning_progress', None) else 0
+            txt = (
+                f"Total episodes recorded: {len(self.episode_bins)}\n"
+                f"Total bins collected (sum episodes): {total_served}\n"
+                f"Average efficiency (bins/distance): {avg_eff:.3f}\n"
+                f"Total distance: {getattr(self, 'total_distance', 0)}"
+            )
+            ax_list[5].text(0.1, 0.5, txt, fontsize=12, va='center')
+
+            fig_comb.tight_layout()
+            save_figure(fig_comb, f"{folder}/combined_performance.png")
+        except Exception:
+            # si algo falla en el combinado, no interrumpir
+            plt.close(fig_comb)
+
+    # -------------------------------------------------------------------
+    #   TRUCK EFFICIENCY PLOT
+    # -------------------------------------------------------------------
+    def _plot_truck_efficiency(self, ax):
+        trucks = self.trucks
+
+        ids = [t.id for t in trucks]
+        collected = [t.collected_bins for t in trucks]
+        distance  = [max(1, t.total_distance) for t in trucks]
+
+        efficiency = [c/d for c, d in zip(collected, distance)]
+
+        bars = ax.bar(ids, efficiency, color='green', alpha=0.7)
+        ax.set_title("Truck Efficiency (Bins per Distance)")
+        ax.set_ylabel("Efficiency")
+        ax.set_xlabel("Truck ID")
+
+        # Etiquetas "Truck 0", "Truck 1", ...
+        ax.set_xticks(ids)
+        ax.set_xticklabels([f"Truck {i}" for i in ids])
+
+        for b, e in zip(bars, efficiency):
+            ax.text(b.get_x()+b.get_width()/2, b.get_height()*1.02,
+                    f"{e:.3f}", ha='center')
+
+    # -------------------------------------------------------------------
+    #   GLOBAL PERFORMANCE
+    # -------------------------------------------------------------------
+    def _plot_global_performance(self, ax):
+        total_collected = sum(getattr(t, 'collected_bins', 0) for t in self.trucks)
+        total_distance  = sum(getattr(t, 'total_distance', 0)  for t in self.trucks)
+        total_capacity  = sum(t.capacity for t in self.trucks)
+
+        metrics = ["Collected", "Distance", "Total Capacity"]
+        values  = [total_collected, total_distance, total_capacity]
+
+        bars = ax.bar(metrics, values, color=['blue', 'orange', 'purple'], alpha=0.7)
+        ax.set_title("Overall Performance")
+        ax.set_ylabel("Value")
+
+        for b, v in zip(bars, values):
+            ax.text(b.get_x()+b.get_width()/2, v*1.02, f"{v}", ha="center")
+
+    # -------------------------------------------------------------------
+    #   SPATIAL MOVEMENT HEATMAP
+    # -------------------------------------------------------------------
+    def _plot_spatial_movement(self, ax):
+        xs, ys = [], []
+
+        for t in self.trucks:
+            if not hasattr(t, 'action_log'):
+                continue
+            for step in t.action_log:
+                # action_log stores (x,y) tuples
+                xs.append(step[0])
+                ys.append(step[1])
+
+        if len(xs) == 0:
+            ax.text(0.5, 0.5, "No movement data", ha="center", va="center")
+            return
+
+        ax.hist2d(xs, ys, bins=20, cmap="Blues")
+        ax.set_title("Truck Position Heatmap")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_aspect("equal")
+
+    # -------------------------------------------------------------------
+    #   BINS PROGRESS OVER TIME
+    # -------------------------------------------------------------------
+    def _plot_bins_progress(self, ax):
+        if len(self.episode_bins) == 0:
+            ax.text(0.5, 0.5, "No bins data", ha="center", va="center")
+            return
+
+        ax.plot(self.episode_bins, label="Bins Collected", linewidth=2)
+        ax.plot(self.episode_distance, label="Distance", linewidth=2)
+        ax.set_title("Episode Progress")
+        ax.set_ylabel("Value")
+        ax.set_xlabel("Step")
+        ax.legend()
+
+    def _plot_truck_individual_performance(self, ax):
+        """
+        Grafica el performance individual de cada truck:
+        - Carga final (current load)
+        - Bins recolectados
+        - Distancia recorrida
+        """
+
+        truck_ids = [f"Truck {t.id}" for t in self.trucks]
+        loads = [t.load for t in self.trucks]
+        bins_collected = [getattr(t, "collected_bins", 0) for t in self.trucks]
+        distances = [getattr(t, "total_distance", 0) for t in self.trucks]
+
+        bar_width = 0.25
+        x = np.arange(len(self.trucks))
+
+        ax.bar(x - bar_width, loads, width=bar_width, label="Final Load", alpha=0.8)
+        ax.bar(x, bins_collected, width=bar_width, label="Bins Collected", alpha=0.8)
+        ax.bar(x + bar_width, distances, width=bar_width, label="Distance", alpha=0.8)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(truck_ids)
+        ax.set_title("Individual Truck Performance")
+        ax.set_ylabel("Value")
+        ax.legend()
+
+        # Mostrar etiquetas numéricas sobre cada barra
+        for values, offset in [(loads, -bar_width), (bins_collected, 0), (distances, bar_width)]:
+            for i, val in enumerate(values):
+                ax.text(
+                    i + offset,
+                    val + max(1, val * 0.02),
+                    f"{val}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8
+                )
 
 
 # -----------------------------
@@ -718,6 +1053,11 @@ def save_frames_as_gif(frames, filename, interval_ms=200):
         optimize=True
     )
 
+def save_figure(fig, path):
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
 # -----------------------------
 # Demo / CLI
 # -----------------------------
@@ -727,6 +1067,7 @@ def demo(config=None):
         cfg.update(config)
     sim = Simulator(cfg)
     stats, frames = sim.run_episode(max_steps=1000, render=True)
+    sim.save_performance_plots('performance_plots')
     if frames:
         save_frames_as_gif(frames, cfg['gif_path'], interval_ms=cfg['frame_interval_ms'])
         print('Saved GIF to', cfg['gif_path'])
