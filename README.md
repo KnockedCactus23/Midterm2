@@ -3,10 +3,10 @@
 Optimización de rutas autónomas para recolección de residuos
 
 Autores:
-José Manuel Sanchez Perez (A01178230)
-Sergio Rodríguez Pérez (A00838856)
-Grecia Klarissa Saucedo Sandoval (A00839374)
-Luis Eduardo Cantú Leyva (A00840016)
+* José Manuel Sanchez Perez (A01178230)
+* Sergio Rodríguez Pérez (A00838856)
+* Grecia Klarissa Saucedo Sandoval (A00839374)
+* Luis Eduardo Cantú Leyva (A00840016)
 
 Tecnológico de Monterrey
 TC2038 — Analysis and Design of Advanced Algorithms
@@ -210,6 +210,8 @@ scipy
 matplotlib
 pillow
 agentpy
+psutil
+memory-profiler
 ```
 
 ### Ejecución básica
@@ -230,7 +232,15 @@ Genera:
 python garbage_collection_agentpy.py --benchmark
 ```
 
-Produce el archivo `benchmark.csv`.
+Produce los archivos `benchmark.csv` y `benchmark_all.csv`.
+
+Los resultados se grafican de la siguiente manera
+
+```
+python plot_benchmarks.py
+```
+
+Produciendo los archivos `memory_usage_all.png`, `runtime_all.png` y `speedup_all.png`.
 
 ### Pruebas unitarias
 
@@ -252,6 +262,7 @@ Pruebas incluidas para:
 Midterm2/
 │-- README.md
 │-- garbage_collection_agentpy.py
+│-- plot_benchmarks.py
 │-- performance_plots/
 │   ├── bins_progress.png
 │   ├── combined_performance.png
@@ -260,8 +271,12 @@ Midterm2/
 │   ├── movement_heatmap.png
 │   ├── truck_individual_performance.png
 │   └── garbage_sim.gif
-│-- results/
+│-- benchmark_plots/
 │   └── benchmark.csv
+│   └── benchmark_all.csv
+│   └── line_memory.csv
+│   └── line_runtime.csv
+│   └── line_speedup.csv
 │-- poster/
 │   └── posterMidterm2.pdf
 │-- requirements.txt
