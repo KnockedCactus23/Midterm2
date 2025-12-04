@@ -1117,6 +1117,94 @@ def run_benchmark(config: dict, repeats: int=3, out_csv: str='benchmark.csv'):
     print(f'Benchmark results written to {out_csv}')
     return rows
 
+# ===============================================================
+#  Benchmark General (A*, D*, Voronoi, y RL)
+# ===============================================================
+def measure_memory(func, *args, **kwargs):
+    """Ejecuta una función midiendo uso pico de memoria (MB)"""
+    mem_before = psutil.Process(os.getpid()).memory_info().rss / 1024**2
+    result = func(*args, **kwargs)
+    mem_after = psutil.Process(os.getpid()).memory_info().rss / 1024**2
+    return result, max(mem_before, mem_after)
+
+def run_benchmark_algorithms(configs, planners, repeats=3, out_csv='benchmark_all.csv'):
+    """
+    configs:  lista de escenarios
+    planners: dict { 'A*':sim.plan_with_astar, 'D*':sim.plan_with_dstar, ... }
+    """
+    header = ['scenario','planner','rep','n_trucks','n_bins','n_obstacles',
+              'plan_time_s','sim_time_s','peak_mem_mb','serviced','energy_penalties','collisions']
+    rows = []
+
+    for cfg in configs:
+        for planner_name, planner_func in planners.items():
+            for rep in range(repeats):
+                sim = Simulator(cfg)
+
+                # ----------------- planificación ----------------------
+                t0 = time.time()
+                peak_mem = 0
+                for t in sim.trucks:
+                    if not sim.bins:
+                        continue
+                    bid = min(range(len(sim.bins)), key=lambda i: manhattan(t.pos, sim.bins[i].pos))
+                    # planner_func is expected to accept (sim, truck, goal)
+                    (p, mem) = measure_memory(planner_func, sim, t, sim.bins[bid].pos)
+                    peak_mem = max(peak_mem, mem)
+                plan_time = time.time() - t0
+
+                # ----------------- simulación -------------------------
+                t1 = time.time()
+                stats, _ = sim.run_episode(max_steps=2000, render=False)
+                sim_time = time.time() - t1
+
+                rows.append([
+                    cfg['name'], planner_name, rep,
+                    cfg['n_trucks'], cfg['n_bins'], cfg['n_obstacles'],
+                    round(plan_time,4), round(sim_time,4), round(peak_mem,2),
+                    stats['serviced'], stats['energy_penalties'], stats['collisions']
+                ])
+                print(f"[{cfg['name']}] {planner_name} rep{rep} serviced={stats['serviced']} time={plan_time:.3f}s mem={peak_mem:.2f}MB")
+
+    with open(out_csv,'w',newline='') as f:
+        csv.writer(f).writerow(header)
+        csv.writer(f).writerows(rows)
+    print(f"Benchmark saved to {out_csv}")
+    return rows
+
+# ===============================================================
+#  Benchmark RL (Reward Efficiency)
+# ===============================================================
+def run_benchmark_rl(agent, env_configs, episodes=10, out_csv="benchmark_rl.csv"):
+    header = ['scenario','episode','reward','bins_serviced','reward_efficiency']
+    rows = []
+
+    for cfg in env_configs:
+        for ep in range(episodes):
+            sim = Simulator(cfg)
+            total_reward = 0
+            bins_before = len(sim.bins)
+
+            done = False
+            while not done:
+                s = sim.get_state()
+                a = agent.choose_action(s)
+                r, done = sim.step(a)
+                total_reward += r
+            
+            bins_after = len(sim.bins)
+            serviced = bins_before - bins_after
+            RE = total_reward / max(serviced,1)
+
+            rows.append([cfg['name'], ep, total_reward, serviced, RE])
+            print(f"RL [{cfg['name']}] ep{ep} reward={total_reward:.1f} RE={RE:.2f}")
+
+    with open(out_csv,'w',newline='') as f:
+        csv.writer(f).writerow(header)
+        csv.writer(f).writerows(rows)
+    print(f"RL benchmark saved to {out_csv}")
+    return rows
+
 # Utilidad para exportar GIF
 def save_frames_as_gif(frames, filename, interval_ms=200):
     if not frames:
@@ -1199,3 +1287,45 @@ if __name__ == '__main__':
     if args.benchmark:
         cfg = DEFAULT_CONFIG.copy()
         run_benchmark(cfg, repeats=cfg['benchmark_repeats'])
+
+        # -------------------------
+        # Run algorithm-level benchmarks (A*, D*, ...)
+        # -------------------------
+        # prepare a simple configs list and planners mapping
+        cfgs = []
+        c0 = cfg.copy()
+        c0['name'] = c0.get('name', 'default')
+        cfgs.append(c0)
+
+        planners = {
+            'A*': lambda sim, truck, goal: sim.plan_with_astar(truck, goal),
+            'D*': lambda sim, truck, goal: DStarLite(sim.world, truck.pos, goal).compute_shortest_path()
+        }
+
+        try:
+            run_benchmark_algorithms(cfgs, planners, repeats=cfg['benchmark_repeats'])
+        except Exception as e:
+            print(f"Error running algorithm benchmarks: {e}")
+
+        # -------------------------
+        # Run RL benchmark if environment exposes RL API
+        # -------------------------
+        # run_benchmark_rl expects an agent with `choose_action(s)` and a Simulator exposing `get_state()` and `step(action)`
+        if hasattr(Simulator, 'get_state') and hasattr(Simulator, 'step'):
+            if ap is None:
+                print("AgentPy not available; skipping RL benchmark")
+            else:
+                # Simple random agent placeholder for RL benchmark
+                class _RandomAgent:
+                    def choose_action(self, s):
+                        # return a random/no-op action; user can replace with a trained agent
+                        return None
+
+                agent = _RandomAgent()
+                env_configs = [c0]
+                try:
+                    run_benchmark_rl(agent, env_configs, episodes=cfg['benchmark_repeats'])
+                except Exception as e:
+                    print(f"Error running RL benchmark: {e}")
+        else:
+            print("Simulator does not expose RL API (get_state/step); skipping RL benchmark")

@@ -1,0 +1,4 @@
+scenario,rep,n_trucks,n_bins,n_obstacles,plan_time_s,sim_time_s,serviced,energy_penalties,collisions
+default,0,4,20,10,0.0,0.0,63,0,5691
+default,1,4,20,10,0.0,0.0,63,0,5691
+default,2,4,20,10,0.0,0.0,63,0,5691
