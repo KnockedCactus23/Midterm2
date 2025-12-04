@@ -78,6 +78,10 @@ DEFAULT_CONFIG = {
     'verbose': False,
     'bin_refill_cooldown': 50,        
     'collision_energy_penalty': 8.0
+    ,
+    # RL benchmark defaults
+    'rl_episodes': 200,
+    'rl_max_steps': 500,
 }
 
 _rng = random.Random()
@@ -817,6 +821,116 @@ class Simulator:
 
         return stats, frames
 
+    # -----------------------------
+    # RL-compatible single-step API
+    # -----------------------------
+    def get_state(self):
+        """Return a compact state dictionary for RL agents."""
+        return {
+            'step': self.t,
+            'bins': [(b.pos, b.level) for b in self.bins],
+            'trucks': [(t.id, t.pos, t.load, t.energy, t.state) for t in self.trucks]
+        }
+
+    def step(self, action=None):
+        """Perform one simulation step. Action is ignored by default (placeholder).
+
+        Returns: (reward: float, done: bool)
+        """
+        # initialize RL counters
+        if not hasattr(self, 'rl_step'):
+            self.rl_step = 0
+        max_steps = int(self.config.get('rl_max_steps', 200))
+
+        # reward measured as number of bins serviced this step
+        before_collected = self.collected_count
+
+        # advance time
+        self.t += 1
+
+        # 1) bins fill
+        self.step_bins()
+
+        # 2) assign tasks greedily (use existing helper)
+        need_bins = self.find_bins_needing_service()
+        for t in self.trucks:
+            if t.state == 'idle' or not t.path:
+                try:
+                    self.assign_task_for_truck(t, need_bins)
+                except Exception:
+                    pass
+
+        # 3) movement and collection (single-step simplified copy)
+        for t in self.trucks:
+            if t.path and len(t.path) > 0:
+                nextpos = t.path.pop(0)
+                # obstacle check
+                if not self.world.is_free(nextpos):
+                    t.path = []
+                    t.state = 'idle'
+                    continue
+                # collision check simplified: if occupied by another truck do not move
+                if any(o.pos == nextpos and o.id != t.id for o in self.trucks):
+                    t.energy -= self.config.get('collision_energy_penalty', 2.0)
+                    continue
+
+                prev = t.pos
+                t.pos = nextpos
+                t.energy = max(0.0, t.energy - t.step_cost())
+                if prev != t.pos:
+                    self.total_distance += 1
+                    t.total_distance += 1
+                    if hasattr(t, 'action_log'):
+                        t.action_log.append(t.pos)
+
+                # collect if arrived to bin
+                if t.state == 'to_bin':
+                    bins_here = [i for i,b in enumerate(self.bins) if b.pos == t.pos]
+                    if bins_here:
+                        b_idx = bins_here[0]
+                        b_obj = self.bins[b_idx]
+                        if b_obj.level > 0:
+                            amount = min(b_obj.level, t.capacity - t.load)
+                            if amount > 0:
+                                t.load += amount
+                                b_obj.level -= amount
+                                try:
+                                    b_obj.mark_collected(self.t)
+                                except Exception:
+                                    b_obj.reserved_by = None
+                                    b_obj.reserved_until = 0
+                                self.collected_count += 1
+                                if hasattr(t, 'collected_bins'):
+                                    t.collected_bins += 1
+                                # if full go to depot
+                                if t.is_full() or t.energy < 0.1 * self.config['truck_energy']:
+                                    depotpos = self.depots[t.home_depot].pos
+                                    path = self.plan_with_astar(t, depotpos)
+                                    if path:
+                                        t.path = path[1:] if len(path) > 1 else []
+                                    t.state = 'to_depot'
+                                else:
+                                    t.state = 'idle'
+                                    t.path = []
+
+            else:
+                # if no path and low energy, go to depot
+                if t.energy <= 0:
+                    t.state = 'idle'
+
+            # if arrived to depot, unload
+            if t.state == 'to_depot' and any(d.pos == t.pos for d in self.depots):
+                t.load = 0.0
+                t.energy = self.config.get('truck_energy', t.energy)
+                t.state = 'idle'
+                t.path = []
+
+        # compute reward and done
+        reward = float(self.collected_count - before_collected)
+        self.rl_step += 1
+        done = self.rl_step >= max_steps
+        return reward, done
+
     # Dibuja el mundo completo como un frame de la simulación
     def draw_clean_world(self, ax):
         # Obstáculos
@@ -1092,7 +1206,7 @@ class Simulator:
 
 
 # Utilidades para benchmark
-def run_benchmark(config: dict, repeats: int=3, out_csv: str='benchmark.csv'):
+def run_benchmark(config: dict, repeats: int=3, out_csv: str='benchmark_plots/benchmark.csv'):
     header = ['scenario','rep','n_trucks','n_bins','n_obstacles','plan_time_s','sim_time_s','serviced','energy_penalties','collisions']
     rows = []
     for rep in range(repeats):
@@ -1118,20 +1232,18 @@ def run_benchmark(config: dict, repeats: int=3, out_csv: str='benchmark.csv'):
     return rows
 
 # ===============================================================
-#  Benchmark General (A*, D*, Voronoi, y RL)
+#  Benchmark General (A*, D*, Voronoi)
 # ===============================================================
+
 def measure_memory(func, *args, **kwargs):
-    """Ejecuta una función midiendo uso pico de memoria (MB)"""
+    # Mide uso de memoria de una función
     mem_before = psutil.Process(os.getpid()).memory_info().rss / 1024**2
     result = func(*args, **kwargs)
     mem_after = psutil.Process(os.getpid()).memory_info().rss / 1024**2
     return result, max(mem_before, mem_after)
 
-def run_benchmark_algorithms(configs, planners, repeats=3, out_csv='benchmark_all.csv'):
-    """
-    configs:  lista de escenarios
-    planners: dict { 'A*':sim.plan_with_astar, 'D*':sim.plan_with_dstar, ... }
-    """
+# Función que corre el benchmark para varios algoritmos
+def run_benchmark_algorithms(configs, planners, repeats=3, out_csv='benchmark_plots/benchmark_all.csv'):
     header = ['scenario','planner','rep','n_trucks','n_bins','n_obstacles',
               'plan_time_s','sim_time_s','peak_mem_mb','serviced','energy_penalties','collisions']
     rows = []
@@ -1141,19 +1253,19 @@ def run_benchmark_algorithms(configs, planners, repeats=3, out_csv='benchmark_al
             for rep in range(repeats):
                 sim = Simulator(cfg)
 
-                # ----------------- planificación ----------------------
+                # planificación
                 t0 = time.time()
                 peak_mem = 0
                 for t in sim.trucks:
                     if not sim.bins:
                         continue
                     bid = min(range(len(sim.bins)), key=lambda i: manhattan(t.pos, sim.bins[i].pos))
-                    # planner_func is expected to accept (sim, truck, goal)
+                    # planner_func se espera que acepte (sim, truck, goal)
                     (p, mem) = measure_memory(planner_func, sim, t, sim.bins[bid].pos)
                     peak_mem = max(peak_mem, mem)
                 plan_time = time.time() - t0
 
-                # ----------------- simulación -------------------------
+                # Simulación
                 t1 = time.time()
                 stats, _ = sim.run_episode(max_steps=2000, render=False)
                 sim_time = time.time() - t1
@@ -1172,38 +1284,19 @@ def run_benchmark_algorithms(configs, planners, repeats=3, out_csv='benchmark_al
     print(f"Benchmark saved to {out_csv}")
     return rows
 
-# ===============================================================
-#  Benchmark RL (Reward Efficiency)
-# ===============================================================
-def run_benchmark_rl(agent, env_configs, episodes=10, out_csv="benchmark_rl.csv"):
-    header = ['scenario','episode','reward','bins_serviced','reward_efficiency']
-    rows = []
-
-    for cfg in env_configs:
-        for ep in range(episodes):
-            sim = Simulator(cfg)
-            total_reward = 0
-            bins_before = len(sim.bins)
-
-            done = False
-            while not done:
-                s = sim.get_state()
-                a = agent.choose_action(s)
-                r, done = sim.step(a)
-                total_reward += r
-            
-            bins_after = len(sim.bins)
-            serviced = bins_before - bins_after
-            RE = total_reward / max(serviced,1)
-
-            rows.append([cfg['name'], ep, total_reward, serviced, RE])
-            print(f"RL [{cfg['name']}] ep{ep} reward={total_reward:.1f} RE={RE:.2f}")
-
-    with open(out_csv,'w',newline='') as f:
-        csv.writer(f).writerow(header)
-        csv.writer(f).writerows(rows)
-    print(f"RL benchmark saved to {out_csv}")
-    return rows
+def voronoi_planner(sim: 'Simulator', truck: 'Truck', goal: GridPos) -> Optional[List[GridPos]]:
+    try:
+        # seleccionar bins en la misma región Voronoi
+        bins_in_partition = [i for i in range(len(sim.bins)) if sim.partitioner.region_of(sim.bins[i].pos) == sim.partitioner.region_of(truck.pos)]
+        if not bins_in_partition:
+            target_pos = goal
+        else:
+            # elegir el bin más cercano en la partición
+            bid = min(bins_in_partition, key=lambda i: manhattan(truck.pos, sim.bins[i].pos))
+            target_pos = sim.bins[bid].pos
+        return astar(sim.world, truck.pos, target_pos)
+    except Exception:
+        return astar(sim.world, truck.pos, goal)
 
 # Utilidad para exportar GIF
 def save_frames_as_gif(frames, filename, interval_ms=200):
@@ -1222,6 +1315,7 @@ def save_frames_as_gif(frames, filename, interval_ms=200):
         optimize=True
     )
 
+# Salvar figura con layout ajustado
 def save_figure(fig, path):
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -1289,9 +1383,9 @@ if __name__ == '__main__':
         run_benchmark(cfg, repeats=cfg['benchmark_repeats'])
 
         # -------------------------
-        # Run algorithm-level benchmarks (A*, D*, ...)
+        # Ejecutar benchmarks a nivel de algoritmo (A*, D*, ...)
         # -------------------------
-        # prepare a simple configs list and planners mapping
+        # Preparar lista simple de configuraciones y mapeo de planificadores
         cfgs = []
         c0 = cfg.copy()
         c0['name'] = c0.get('name', 'default')
@@ -1299,33 +1393,11 @@ if __name__ == '__main__':
 
         planners = {
             'A*': lambda sim, truck, goal: sim.plan_with_astar(truck, goal),
-            'D*': lambda sim, truck, goal: DStarLite(sim.world, truck.pos, goal).compute_shortest_path()
+            'D*': lambda sim, truck, goal: DStarLite(sim.world, truck.pos, goal).compute_shortest_path(),
+            'Voronoi': lambda sim, truck, goal: voronoi_planner(sim, truck, goal)
         }
 
         try:
             run_benchmark_algorithms(cfgs, planners, repeats=cfg['benchmark_repeats'])
         except Exception as e:
             print(f"Error running algorithm benchmarks: {e}")
-
-        # -------------------------
-        # Run RL benchmark if environment exposes RL API
-        # -------------------------
-        # run_benchmark_rl expects an agent with `choose_action(s)` and a Simulator exposing `get_state()` and `step(action)`
-        if hasattr(Simulator, 'get_state') and hasattr(Simulator, 'step'):
-            if ap is None:
-                print("AgentPy not available; skipping RL benchmark")
-            else:
-                # Simple random agent placeholder for RL benchmark
-                class _RandomAgent:
-                    def choose_action(self, s):
-                        # return a random/no-op action; user can replace with a trained agent
-                        return None
-
-                agent = _RandomAgent()
-                env_configs = [c0]
-                try:
-                    run_benchmark_rl(agent, env_configs, episodes=cfg['benchmark_repeats'])
-                except Exception as e:
-                    print(f"Error running RL benchmark: {e}")
-        else:
-            print("Simulator does not expose RL API (get_state/step); skipping RL benchmark")

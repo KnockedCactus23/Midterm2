@@ -1,7 +1,0 @@
-scenario,planner,rep,n_trucks,n_bins,n_obstacles,plan_time_s,sim_time_s,peak_mem_mb,serviced,energy_penalties,collisions
-default,A*,0,4,20,10,0.0002,0.4376,186.95,63,0,5691
-default,A*,1,4,20,10,0.0001,0.4372,186.95,63,0,5691
-default,A*,2,4,20,10,0.0001,0.4359,186.95,63,0,5691
-default,D*,0,4,20,10,0.4043,0.449,195.39,63,0,5691
-default,D*,1,4,20,10,0.3929,0.4466,195.67,63,0,5691
-default,D*,2,4,20,10,0.3927,0.4393,195.67,63,0,5691
