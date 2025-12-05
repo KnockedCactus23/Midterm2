@@ -229,8 +229,9 @@ performance_plots/
 │── movement_heatmap.png
 │── truck_efficiency.png
 │── truck_individual_performance.png
+│── garbage_sim.gif
+benchmark_plots/
 │── runtime_all.png
 │── memory_usage_all.png
 │── speedup_all.png
-│── garbage_sim.gif
 ```
