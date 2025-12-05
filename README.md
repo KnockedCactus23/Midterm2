@@ -311,3 +311,11 @@ Los resultados muestran eficiencia estable, baja tasa de conflictos y comportami
 Koenig, S., & Likhachev, M. (2002). D* Lite. Proceedings of AAAI.
 Okabe, A., Boots, B., Sugihara, K., & Chiu, S. N. (2000). Spatial Tessellations: Concepts and Applications of Voronoi Diagrams.
 Sutton, R. S., & Barto, A. G. (2018). Reinforcement Learning: An Introduction.
+
+---
+
+## 13. Contribución
+* Sergio Rodríguez Pérez: Implementación de  A*, D* y gráficas de performance
+* José Manuel Sanchez Pérez: Implementación de Voronoi
+* Grecia Klarissa Saucedo Sandoval: Implementación de reinforcement learning y poster
+* Luis Eduardo Cantú Leyva: Implementación de reinforcement learning y gráficas de benchmark
