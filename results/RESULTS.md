@@ -158,7 +158,7 @@ Interpretation:
 
 **Figure: Memory Usage (`memory_usage_all.png`)**
 
-![Memory](../performance_plots/memory_usage_all.png)
+![Memory](../benchmark_plots/memory_usage_all.png)
 
 All algorithms show stable memory usage:
 
@@ -175,7 +175,7 @@ Incremental search (D*) increases memory footprint slightly but dramatically red
 
 **Figure: Speedup vs A* (`speedup_all.png`)**
 
-![Speedup](../performance_plots/speedup_all.png)
+![Speedup](../benchmark_plots/speedup_all.png)
 
 Observations:
 
@@ -188,7 +188,7 @@ Observations:
 
 **Figure: Garbage Collection Simulation (`garbage_sim.gif` / frame)**
 
-![Simulation](../performance_plots/garbage_sim.gif)
+![Simulation](../benchmark_plots/garbage_sim.gif)
 
 This visualization illustrates:
 
