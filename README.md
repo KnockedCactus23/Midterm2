@@ -316,6 +316,6 @@ Sutton, R. S., & Barto, A. G. (2018). Reinforcement Learning: An Introduction.
 
 ## 13. Contribuciones
 * Sergio Rodríguez Pérez: Implementación de  A*, D* y gráficas de performance
-* José Manuel Sanchez Pérez: Implementación de Voronoi
+* José Manuel Sanchez Pérez: Implementación de Voronoi y gráficas de benchmark
 * Grecia Klarissa Saucedo Sandoval: Implementación de reinforcement learning y poster
 * Luis Eduardo Cantú Leyva: Implementación de reinforcement learning y gráficas de benchmark
