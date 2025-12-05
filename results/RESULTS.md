@@ -144,7 +144,7 @@ This aggregated visualization confirms internal consistency across all metrics a
 
 **Figure: Runtime (`runtime_all.png`)**
 
-![Runtime](../performance_plots/runtime_all.png)
+![Runtime](../benchmark_plots/runtime_all.png)
 
 Interpretation:
 
@@ -188,7 +188,7 @@ Observations:
 
 **Figure: Garbage Collection Simulation (`garbage_sim.gif` / frame)**
 
-![Simulation](../benchmark_plots/garbage_sim.gif)
+![Simulation](../performance_plots/garbage_sim.gif)
 
 This visualization illustrates:
 
